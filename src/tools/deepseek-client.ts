@@ -665,10 +665,19 @@ export async function sendDeepSeekPrompt(
   const mode = options?.mode ?? 'quick';
   const deepthink = options?.deepthink ?? false;
   const smartSearch = options?.smartSearch ?? false;
+  const conversation = options?.conversation ?? 'continue';
 
-  // 1. Ensure we're on the chat page
-  if (!page.url().startsWith(CHAT_URL)) {
+  // 1. Handle conversation control
+  if (conversation === 'new') {
+    // Start a fresh conversation - navigate to the base chat URL
+    // DeepSeek treats a fresh load of the base URL as a new conversation
     await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+  } else {
+    // Continue existing conversation - only navigate if not already on chat page
+    if (!page.url().startsWith(CHAT_URL)) {
+      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded' });
+    }
   }
 
   // 2. Switch mode if needed

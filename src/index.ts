@@ -171,6 +171,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 'Enable Smart Search /联网搜索 for web results (quick mode only, default: false)',
             },
+            conversation: {
+              type: 'string',
+              enum: ['continue', 'new'],
+              description:
+                'Conversation control: "continue" (default) appends to current conversation, ' +
+                '"new" starts a fresh conversation without previous context',
+            },
           },
           required: ['prompt'],
         },

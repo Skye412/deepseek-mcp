@@ -32,6 +32,12 @@ export interface ChatOptions {
   deepthink?: boolean;
   /** Enable Smart Search /联网搜索, quick mode only (default: false) */
   smartSearch?: boolean;
+  /**
+   * Conversation control:
+   * - undefined / 'continue': append to current conversation (default)
+   * - 'new': start a fresh conversation, discarding previous context
+   */
+  conversation?: 'continue' | 'new';
 }
 
 // ============================================================================
@@ -51,6 +57,8 @@ export interface ChatParams {
   deepthink?: boolean;
   /** Enable Smart Search (联网搜索), quick mode only */
   smartSearch?: boolean;
+  /** 'continue' (default) keeps conversation context, 'new' starts fresh */
+  conversation?: 'continue' | 'new';
 }
 
 /**

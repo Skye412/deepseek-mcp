@@ -24,5 +24,6 @@ export async function deepseekChat(
     mode: params.mode,
     deepthink: params.deepthink,
     smartSearch: params.smartSearch,
+    conversation: params.conversation,
   });
 }
