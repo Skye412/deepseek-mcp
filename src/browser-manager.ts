@@ -1,39 +1,49 @@
 /**
  * Browser Manager
- * 
+ *
  * Manages Playwright browser instances for the DeepSeek MCP server.
- * Supports headless/headed mode, timeout configuration, and viewport settings.
+ * Uses launchPersistentContext with a user-data-dir to persist cookies
+ * and login sessions across server restarts.
  */
 
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
+import { chromium, BrowserContext, Page } from 'playwright';
+import { homedir } from 'os';
+import { join } from 'path';
 
 /**
  * Configuration options for BrowserManager
  */
 export interface BrowserOptions {
-  /** Run browser in headless mode (default: true) */
+  /** Run browser in headless mode (default: false, needs headed for first login) */
   headless?: boolean;
   /** Default timeout for operations in milliseconds (default: 30000) */
   timeout?: number;
   /** Browser viewport size */
-  viewport?: {
-    width: number;
-    height: number;
-  };
+  viewport?: { width: number; height: number };
+  /**
+   * Path to user data directory for session persistence.
+   * Cookies, localStorage, and login state are stored here.
+   * Default: ~/.deepseek-mcp/browser-data
+   */
+  userDataDir?: string;
 }
 
 /**
- * BrowserManager - Manages Playwright browser lifecycle
- * 
- * Provides methods to initialize, control, and shutdown a Chromium browser.
- * Implements basic login state tracking and proper resource cleanup.
+ * BrowserManager - Manages Playwright browser lifecycle with session persistence
+ *
+ * Uses chromium.launchPersistentContext() to automatically persist cookies
+ * and login state between server restarts. First run requires manual login;
+ * subsequent runs restore the session automatically.
  */
 export class BrowserManager {
-  private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
-  private options: Required<BrowserOptions>;
-  private loggedIn: boolean = false;
+  private options: {
+    headless: boolean;
+    timeout: number;
+    viewport: { width: number; height: number };
+    userDataDir: string;
+  };
 
   /**
    * Create a new BrowserManager instance
@@ -41,67 +51,94 @@ export class BrowserManager {
    */
   constructor(options?: BrowserOptions) {
     this.options = {
-      headless: options?.headless ?? true,
+      headless: options?.headless ?? false,
       timeout: options?.timeout ?? 30000,
       viewport: options?.viewport ?? { width: 1280, height: 720 },
+      userDataDir: options?.userDataDir ?? join(homedir(), '.deepseek-mcp', 'browser-data'),
     };
   }
 
   /**
-   * Initialize the browser instance
-   * Creates a Chromium browser, context, and initial page
+   * Initialize the browser with persistent context.
+   * Uses the user-data-dir to restore cookies and login state from previous sessions.
    * @throws Error if browser initialization fails
    */
   async initialize(): Promise<void> {
-    if (this.browser) {
-      console.warn('Browser already initialized');
+    if (this.isInitialized()) {
       return;
     }
 
+    if (this.context || this.page) {
+      await this.close();
+    }
+
     try {
-      // Launch Chromium with configured options
-      this.browser = await chromium.launch({
+      // Launch persistent context - cookies/localStorage are saved to userDataDir
+      // and restored automatically on next launch
+      this.context = await chromium.launchPersistentContext(this.options.userDataDir, {
         headless: this.options.headless,
-      });
-
-      // Create a new browser context with viewport
-      this.context = await this.browser.newContext({
+        channel: 'msedge',
         viewport: this.options.viewport,
-        timeout: this.options.timeout,
       });
 
-      // Create initial page
-      this.page = await this.context.newPage();
+      this.context.on('close', () => {
+        this.context = null;
+        this.page = null;
+      });
 
-      console.log('Browser initialized successfully');
+      // Use existing page or create a new one
+      const pages = this.context.pages();
+      this.page = pages.length > 0 ? pages[0] : await this.context.newPage();
+      this.page.setDefaultTimeout(this.options.timeout);
+      this.page.on('close', () => {
+        this.page = null;
+      });
     } catch (error) {
       await this.close();
-      throw new Error(`Failed to initialize browser: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(
+        `Failed to initialize browser: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   }
 
   /**
-   * Check if the user is logged in
-   * @returns true if logged in, false otherwise
+   * Check if the user is logged into DeepSeek by inspecting the current page.
+   * Navigates to chat.deepseek.com if not already there, then checks for
+   * the chat input element (textarea/contenteditable).
+   * @returns true if logged in with a visible chat composer, false otherwise
    */
-  isLoggedIn(): boolean {
-    return this.loggedIn;
+  async isLoggedIn(): Promise<boolean> {
+    const page = this.getPage();
+    if (!page) return false;
+
+    const url = page.url();
+
+    // If on login page, not logged in
+    if (url.includes('/sign_in') || url.includes('/login')) {
+      return false;
+    }
+
+    // If not on chat.deepseek.com at all, not logged in
+    if (!url.startsWith('https://chat.deepseek.com/')) {
+      return false;
+    }
+
+    // Check for chat input presence (textarea, contenteditable, or textbox role)
+    try {
+      const hasComposer = await page.$(
+        'textarea, div[contenteditable="true"], [role="textbox"]'
+      );
+      return hasComposer !== null;
+    } catch {
+      return false;
+    }
   }
 
   /**
-   * Set login state
-   * @param state - Whether user is logged in
-   */
-  setLoggedIn(state: boolean): void {
-    this.loggedIn = state;
-  }
-
-  /**
-   * Close the browser and cleanup all resources
-   * Safe to call multiple times
+   * Close the browser and cleanup all resources.
+   * Safe to call multiple times. Context data is persisted to userDataDir on close.
    */
   async close(): Promise<void> {
-    // Close in reverse order of creation
     try {
       if (this.page) {
         await this.page.close();
@@ -120,24 +157,16 @@ export class BrowserManager {
       console.error('Error closing context:', error);
     }
 
-    try {
-      if (this.browser) {
-        await this.browser.close();
-        this.browser = null;
-      }
-    } catch (error) {
-      console.error('Error closing browser:', error);
-    }
-
-    this.loggedIn = false;
+    this.page = null;
+    this.context = null;
   }
 
   /**
-   * Get the current browser instance
-   * @returns Browser instance or null if not initialized
+   * Get the current page
+   * @returns Page instance or null if not initialized
    */
-  getBrowser(): Browser | null {
-    return this.browser;
+  getPage(): Page | null {
+    return this.page && !this.page.isClosed() ? this.page : null;
   }
 
   /**
@@ -149,26 +178,26 @@ export class BrowserManager {
   }
 
   /**
-   * Get the current page
-   * @returns Page instance or null if not initialized
-   */
-  getPage(): Page | null {
-    return this.page;
-  }
-
-  /**
    * Check if the browser is initialized and running
-   * @returns true if browser is initialized, false otherwise
+   * @returns true if context and page are available
    */
   isInitialized(): boolean {
-    return this.browser !== null;
+    return Boolean(this.context && this.page && !this.page.isClosed());
   }
 
   /**
-   * Get the configured options
-   * @returns Browser configuration options
+   * Ensure the browser is initialized. Initializes if needed.
    */
-  getOptions(): Required<BrowserOptions> {
+  async ensureReady(): Promise<void> {
+    if (!this.isInitialized()) {
+      await this.initialize();
+    }
+  }
+
+  /**
+   * Get the configured options (copy)
+   */
+  getOptions() {
     return { ...this.options };
   }
 }

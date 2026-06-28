@@ -4,8 +4,10 @@
  *
  * A Model Context Protocol server providing DeepSeek AI tools for chat,
  * code review, idea evaluation, explanation, summarization, and debugging.
- * Uses Playwright for browser automation and CredentialManager for secure
- * credential storage with AES-256-GCM encryption.
+ *
+ * Uses Playwright for browser automation with persistent session storage.
+ * First run requires manual login (phone + verification code).
+ * Subsequent runs restore the session automatically from saved browser data.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -15,14 +17,13 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { BrowserManager } from './browser-manager.js';
-import { CredentialManager } from './credential-manager.js';
-import { deepseekChat } from './tools/chat.js';
-import { deepseekCodeReview } from './tools/code-review.js';
-import { deepseekEvaluateIdea } from './tools/evaluate-idea.js';
-import { deepseekExplain } from './tools/explain.js';
-import { deepseekSummarize } from './tools/summarize.js';
-import { deepseekDebug } from './tools/debug.js';
+import { BrowserManager } from './browser-manager';
+import { deepseekChat } from './tools/chat';
+import { deepseekCodeReview } from './tools/code-review';
+import { deepseekEvaluateIdea } from './tools/evaluate-idea';
+import { deepseekExplain } from './tools/explain';
+import { deepseekSummarize } from './tools/summarize';
+import { deepseekDebug } from './tools/debug';
 
 import type {
   ChatParams,
@@ -31,72 +32,91 @@ import type {
   ExplainParams,
   SummarizeParams,
   DebugParams,
-} from './types/index.js';
+} from './types';
 
 // ── Singletons ──────────────────────────────────────────────────────────────
 
-const credentialManager = new CredentialManager();
 const browserManager = new BrowserManager({ headless: true });
 
 /**
- * Navigate to DeepSeek chat and log in using stored credentials.
- * Skipped if the browser reports that the user is already logged in.
+ * Ensure the user is logged into DeepSeek.
+ * 1. Check if persistent session is still valid (headless)
+ * 2. If yes, use it (no login needed)
+ * 3. If no, relaunch browser with visible window for manual login,
+ *    then switch back to headless mode. Session persists via user-data-dir.
  */
-async function autoLogin(): Promise<void> {
-  const masterPassword = process.env.DEEPSEEK_MASTER_PASSWORD;
-  if (!masterPassword) {
-    console.warn(
-      'DEEPSEEK_MASTER_PASSWORD not set — skipping automatic login. ' +
-      'Tools that require authentication will fail until you log in manually.'
-    );
-    return;
-  }
-
-  if (browserManager.isLoggedIn()) {
-    return;
-  }
-
-  if (!credentialManager.hasCredentials()) {
-    console.warn(
-      'No stored credentials found. Run saveCredentials first ' +
-      'or set DEEPSEEK_MASTER_PASSWORD only after credentials have been saved.'
-    );
-    return;
-  }
-
+async function ensureLoggedIn(): Promise<void> {
   const page = browserManager.getPage();
   if (!page) {
     throw new Error('Browser page not available for login');
   }
 
-  const { email, password } = await credentialManager.getCredentials(masterPassword);
-
-  // Navigate to DeepSeek login page
-  await page.goto('https://chat.deepseek.com/sign_in', { waitUntil: 'networkidle' });
-
-  // Fill email
-  const emailSelector = 'input[type="email"], input[name="email"], #email';
-  await page.waitForSelector(emailSelector, { timeout: 10000 });
-  await page.fill(emailSelector, email);
-
-  // Fill password
-  const passwordSelector = 'input[type="password"], input[name="password"], #password';
-  await page.waitForSelector(passwordSelector, { timeout: 5000 });
-  await page.fill(passwordSelector, password);
-
-  // Submit login form
-  const submitSelector = 'button[type="submit"], button:has-text("Log in"), button:has-text("登录")';
-  const submitButton = await page.$(submitSelector);
-  if (submitButton) {
-    await submitButton.click();
-  } else {
-    await page.keyboard.press('Enter');
+  // Check if already logged in (persistent session)
+  if (await browserManager.isLoggedIn()) {
+    return;
   }
 
-  // Wait for navigation / chat page to load
-  await page.waitForURL('**/chat**', { timeout: 30000 });
-  browserManager.setLoggedIn(true);
-  console.error('Automatic login successful');
+  // Navigate to DeepSeek
+  if (!page.url().startsWith('https://chat.deepseek.com/')) {
+    await page.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded' });
+  }
+
+  // Check again after navigation (session might be restored from cookies)
+  if (await browserManager.isLoggedIn()) {
+    console.error('[deepseek] Session restored from saved browser data');
+    return;
+  }
+
+  // Need manual login - switch to visible browser so user can interact
+  console.error('[deepseek] No saved session found, opening browser for manual login...');
+  await browserManager.close();
+
+  // Relaunch with visible window
+  const opts = browserManager.getOptions();
+  const headedManager = new BrowserManager({ ...opts, headless: false });
+  await headedManager.initialize();
+  const headedPage = headedManager.getPage();
+  if (!headedPage) {
+    throw new Error('Failed to create visible browser page');
+  }
+
+  if (!headedPage.url().startsWith('https://chat.deepseek.com/')) {
+    await headedPage.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded' });
+  }
+
+  console.error('');
+  console.error('=========================================');
+  console.error('  Please login manually in the browser');
+  console.error('  (Phone number + verification code)');
+  console.error('  Waiting up to 5 minutes...');
+  console.error('  Session will be saved automatically');
+  console.error('=========================================');
+  console.error('');
+
+  try {
+    await headedPage.waitForFunction(
+      `(() => {
+        const url = window.location.href;
+        const onLoginPage = url.includes('/sign_in') || url.includes('/login');
+        const hasComposer = Boolean(
+          document.querySelector('textarea, div[contenteditable="true"], [role="textbox"]')
+        );
+        return url.startsWith('https://chat.deepseek.com/') && !onLoginPage && hasComposer;
+      })()`,
+      undefined,
+      { timeout: 300000 }
+    );
+
+    console.error('[deepseek] Login successful! Session saved for future use.');
+  } catch {
+    await headedManager.close();
+    throw new Error('Login timeout (5 minutes). Please restart and try again.');
+  }
+
+  // Close headed browser, relaunch headless (session is persisted in user-data-dir)
+  await headedManager.close();
+  await browserManager.initialize();
+  console.error('[deepseek] Switched back to headless mode');
 }
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
@@ -104,7 +124,7 @@ async function autoLogin(): Promise<void> {
 const server = new Server(
   {
     name: 'deepseek-mcp',
-    version: '1.0.0',
+    version: '2.0.0',
   },
   {
     capabilities: {
@@ -114,23 +134,42 @@ const server = new Server(
 );
 
 /**
- * List available tools
+ * List available tools with their schemas.
+ * All tools now support the deepthink parameter.
+ * The chat tool additionally supports mode and smartSearch.
  */
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
-      // ── DeepSeek AI Tools ──────────────────────────────────────────────
       {
         name: 'deepseek_chat',
         description:
           'Send a prompt to DeepSeek and return the AI response. ' +
-          'General-purpose chat for questions, writing, translation, and more.',
+          'Supports three modes: quick (default, with search+upload), ' +
+          'expert (reasoning-focused), vision (image analysis). ' +
+          'All modes support DeepThink reasoning.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             prompt: {
               type: 'string',
               description: 'The prompt or message to send to DeepSeek',
+            },
+            mode: {
+              type: 'string',
+              enum: ['quick', 'expert', 'vision'],
+              description:
+                'Chat mode: quick (default, with search+upload), ' +
+                'expert (reasoning-focused), vision (image analysis)',
+            },
+            deepthink: {
+              type: 'boolean',
+              description: 'Enable DeepThink reasoning mode (default: false)',
+            },
+            smartSearch: {
+              type: 'boolean',
+              description:
+                'Enable Smart Search /联网搜索 for web results (quick mode only, default: false)',
             },
           },
           required: ['prompt'],
@@ -149,4 +188,216 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: 'The source code to review',
             },
             language: {
-      
+              type: 'string',
+              description: 'Programming language of the code (e.g., "typescript", "python")',
+            },
+            deepthink: {
+              type: 'boolean',
+              description: 'Enable DeepThink for more thorough analysis (default: false)',
+            },
+          },
+          required: ['code'],
+        },
+      },
+      {
+        name: 'deepseek_evaluate_idea',
+        description:
+          'Evaluate a technical idea or research proposal for innovation, ' +
+          'feasibility, and potential impact.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            idea: {
+              type: 'string',
+              description: 'The idea or proposal to evaluate',
+            },
+            context: {
+              type: 'string',
+              description: 'Additional background context or constraints for the evaluation',
+            },
+            deepthink: {
+              type: 'boolean',
+              description: 'Enable DeepThink for deeper evaluation (default: false)',
+            },
+          },
+          required: ['idea'],
+        },
+      },
+      {
+        name: 'deepseek_explain',
+        description:
+          'Get a clear explanation of a concept, code snippet, or text ' +
+          'at a specified difficulty level.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            text: {
+              type: 'string',
+              description: 'The text, concept, or code to explain',
+            },
+            level: {
+              type: 'string',
+              enum: ['beginner', 'intermediate', 'expert'],
+              description: 'Difficulty level for the explanation (default: intermediate)',
+            },
+            deepthink: {
+              type: 'boolean',
+              description: 'Enable DeepThink for more detailed explanations (default: false)',
+            },
+          },
+          required: ['text'],
+        },
+      },
+      {
+        name: 'deepseek_summarize',
+        description: 'Summarize long text into key points, with an optional maximum length constraint.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            text: {
+              type: 'string',
+              description: 'The text to summarize',
+            },
+            max_length: {
+              type: 'number',
+              description: 'Maximum number of characters for the summary (optional)',
+            },
+            deepthink: {
+              type: 'boolean',
+              description: 'Enable DeepThink for better summarization (default: false)',
+            },
+          },
+          required: ['text'],
+        },
+      },
+      {
+        name: 'deepseek_debug',
+        description: 'Analyse an error message and related code to suggest likely causes and fixes.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            error: {
+              type: 'string',
+              description: 'The error message or exception text',
+            },
+            code: {
+              type: 'string',
+              description: 'The source code where the error occurred (optional)',
+            },
+            context: {
+              type: 'string',
+              description: 'Additional context such as stack trace or logs (optional)',
+            },
+            deepthink: {
+              type: 'boolean',
+              description: 'Enable DeepThink for deeper analysis (default: false)',
+            },
+          },
+          required: ['error'],
+        },
+      },
+    ],
+  };
+});
+
+/**
+ * Handle tool calls and dispatch to the appropriate handler.
+ * Ensures browser is initialized and user is logged in before each call.
+ */
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  // Ensure browser is initialized
+  if (!browserManager.isInitialized()) {
+    await browserManager.initialize();
+  }
+
+  // Ensure user is logged in (uses persistent session if available)
+  try {
+    await ensureLoggedIn();
+  } catch (loginError) {
+    console.error(
+      'Login failed:',
+      loginError instanceof Error ? loginError.message : String(loginError)
+    );
+    // Continue — the tool call itself will report the auth error
+  }
+
+  try {
+    switch (name) {
+      case 'deepseek_chat': {
+        const params = args as unknown as ChatParams;
+        const result = await deepseekChat(browserManager, params);
+        return { content: [{ type: 'text' as const, text: result }] };
+      }
+
+      case 'deepseek_code_review': {
+        const params = args as unknown as CodeReviewParams;
+        const result = await deepseekCodeReview(browserManager, params);
+        return { content: [{ type: 'text' as const, text: result }] };
+      }
+
+      case 'deepseek_evaluate_idea': {
+        const params = args as unknown as EvaluateIdeaParams;
+        const result = await deepseekEvaluateIdea(browserManager, params);
+        return { content: [{ type: 'text' as const, text: result }] };
+      }
+
+      case 'deepseek_explain': {
+        const params = args as unknown as ExplainParams;
+        const result = await deepseekExplain(browserManager, params);
+        return { content: [{ type: 'text' as const, text: result }] };
+      }
+
+      case 'deepseek_summarize': {
+        const params = args as unknown as SummarizeParams;
+        const result = await deepseekSummarize(browserManager, params);
+        return { content: [{ type: 'text' as const, text: result }] };
+      }
+
+      case 'deepseek_debug': {
+        const params = args as unknown as DebugParams;
+        const result = await deepseekDebug(browserManager, params);
+        return { content: [{ type: 'text' as const, text: result }] };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: 'text' as const, text: `Error: ${errorMessage}` }],
+      isError: true,
+    };
+  }
+});
+
+// ── Lifecycle ───────────────────────────────────────────────────────────────
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('DeepSeek MCP Server v2.0.0 running on stdio');
+}
+
+async function cleanup() {
+  if (browserManager.isInitialized()) {
+    await browserManager.close();
+  }
+}
+
+process.on('SIGINT', async () => {
+  await cleanup();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await cleanup();
+  process.exit(0);
+});
+
+main().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
